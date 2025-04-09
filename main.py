@@ -1,4 +1,17 @@
-from flask import Flask from threading import Thread import logging import random import numpy as np import pandas as pd import gspread from oauth2client.service_account import ServiceAccountCredentials from telegram.ext import Updater, MessageHandler, Filters from apscheduler.schedulers.background import BackgroundScheduler from sklearn.ensemble import RandomForestClassifier, GradientBoostingClassifier, AdaBoostClassifier from sklearn.linear_model import LogisticRegression from sklearn.svm import SVC from sklearn.naive_bayes import GaussianNB
+from flask import Flask
+from threading import Thread
+import logging
+import random
+import numpy as np
+import pandas as pd
+import gspread
+from oauth2client.service_account import ServiceAccountCredentials
+from telegram.ext import Updater, MessageHandler, Filters
+from apscheduler.schedulers.background import BackgroundScheduler
+from sklearn.ensemble import RandomForestClassifier, GradientBoostingClassifier, AdaBoostClassifier
+from sklearn.linear_model import LogisticRegression
+from sklearn.svm import SVC
+from sklearn.naive_bayes import GaussianNB
 
 === Flask app giữ cho bot sống ===
 
