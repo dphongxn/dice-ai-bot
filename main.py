@@ -1,78 +1,53 @@
+import os
+import json
 from flask import Flask
 from threading import Thread
+
+app = Flask(__name__)
+
+@app.route('/')
+def home():
+    return "Bot is alive!"
+
+def run():
+    app.run(host='0.0.0.0', port=10000)
+
+def keep_alive():
+    t = Thread(target=run)
+    t.start()
+
+# --- BẮT ĐẦU BOT ---
 import logging
 import random
 import gspread
 import numpy as np
 import pandas as pd
-from sklearn.ensemble import GradientBoostingClassifier, RandomForestClassifier, AdaBoostClassifier
+from sklearn.ensemble import RandomForestClassifier, GradientBoostingClassifier
 from sklearn.linear_model import LogisticRegression
+from sklearn.neighbors import KNeighborsClassifier
+from sklearn.tree import DecisionTreeClassifier
 from sklearn.naive_bayes import GaussianNB
-from sklearn.svm import SVC
 from oauth2client.service_account import ServiceAccountCredentials
 from telegram.ext import Updater, MessageHandler, Filters
 from apscheduler.schedulers.background import BackgroundScheduler
-import os
 
-# === Flask setup để giữ bot sống ===
-app = Flask(__name__)
-@app.route("/")
-def home():
-    return "✅ Bot is alive!"
-def run(): app.run(host="0.0.0.0", port=10000)
-def keep_alive():
-    t = Thread(target=run)
-    t.start()
+# Ghi file credentials.json từ biến môi trường
+if os.getenv("GOOGLE_CREDENTIALS_JSON"):
+    with open("credentials.json", "w") as f:
+        json.dump(json.loads(os.environ["GOOGLE_CREDENTIALS_JSON"]), f)
 
-# === Cài đặt logging và biến môi trường ===
-logging.basicConfig(format="%(asctime)s - %(levelname)s - %(message)s", level=logging.INFO)
-TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
-CREDENTIALS_JSON = os.getenv("CREDENTIALS_JSON_PATH", "credentials.json")
+# Thiết lập log
+logging.basicConfig(format='%(asctime)s - %(levelname)s - %(message)s', level=logging.INFO)
 
-# === Google Sheet ===
+TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")  # Bạn cần thêm TELEGRAM_TOKEN trong Render Environment
+
+# Kết nối Google Sheet
 scope = ["https://spreadsheets.google.com/feeds", "https://www.googleapis.com/auth/drive"]
-creds = ServiceAccountCredentials.from_json_keyfile_name(CREDENTIALS_JSON, scope)
+creds = ServiceAccountCredentials.from_json_keyfile_name("credentials.json", scope)
 client = gspread.authorize(creds)
 sheet = client.open("app dự đoán 1mf3").worksheet("App dự đoán beta")
 
-# === AI: Huấn luyện 6 mô hình cho từng chỉ số (3 chỉ số × 6 mô hình) ===
-def train_models(data):
-    X, Y = [], [[], [], []]
-    for i in range(len(data) - 1):
-        try:
-            x = list(map(int, data[i][4:7]))
-            y = list(map(int, data[i+1][4:7]))
-            X.append(x)
-            for j in range(3): Y[j].append(y[j])
-        except: continue
-    if not X: return [None]*6
-
-    models = [
-        GradientBoostingClassifier(),
-        RandomForestClassifier(),
-        LogisticRegression(max_iter=1000),
-        AdaBoostClassifier(),
-        GaussianNB(),
-        SVC(probability=True)
-    ]
-    trained = []
-    for i in range(3):
-        for model in models:
-            trained.append(model.fit(X, Y[i]))
-    return trained
-
-# === Dự đoán dựa trên bỏ phiếu của 6 mô hình ===
-def majority_vote(trained_models, last_result):
-    if not trained_models or not last_result:
-        return random.sample(range(1,7), 3)
-    x = np.array(last_result).reshape(1, -1)
-    results = []
-    for i in range(3):
-        preds = [trained_models[i + j*3].predict(x)[0] for j in range(6)]
-        results.append(int(pd.Series(preds).mode()[0]))
-    return results
-
-# === Tính tỉ lệ đúng ===
+# Tính tỉ lệ đúng
 def calculate_accuracy():
     data = sheet.get_all_values()
     total, correct = 0, 0
@@ -80,19 +55,57 @@ def calculate_accuracy():
         try:
             pred = list(map(int, row[1:4]))
             real = list(map(int, row[4:7]))
-            if set(pred) == set(real): correct += 1
+            if set(pred) == set(real):
+                correct += 1
             total += 1
-        except: continue
+        except:
+            continue
     return round(correct / total * 100, 2) if total else 0
 
-# === Xử lý tin nhắn Telegram ===
+# Huấn luyện nhiều mô hình và chọn mô hình tốt nhất
+def train_model(data):
+    X, y1, y2, y3 = [], [], [], []
+    for i in range(len(data)-1):
+        try:
+            x = list(map(int, data[i][4:7]))
+            y = list(map(int, data[i+1][4:7]))
+            X.append(x)
+            y1.append(y[0])
+            y2.append(y[1])
+            y3.append(y[2])
+        except:
+            continue
+    if not X: return None
+
+    models = [RandomForestClassifier(), GradientBoostingClassifier(), 
+              KNeighborsClassifier(), DecisionTreeClassifier(), 
+              LogisticRegression(max_iter=1000), GaussianNB()]
+
+    def fit_models(targets): return [m.fit(X, targets) for m in models]
+    m1 = fit_models(y1)
+    m2 = fit_models(y2)
+    m3 = fit_models(y3)
+
+    return m1, m2, m3
+
+# Dự đoán theo mô hình trung bình
+def predict_next(model_group, last_result):
+    if not model_group: return random.sample(range(1, 7), 3)
+    x = np.array(last_result).reshape(1, -1)
+    try:
+        return [int(np.mean([m.predict(x)[0] for m in group])) for group in model_group]
+    except:
+        return random.sample(range(1, 7), 3)
+
+# Xử lý tin nhắn Telegram
 def handle_message(update, context):
     text = update.message.text.strip()
     try:
         parts = list(map(int, text.split()))
-        if len(parts) != 3: raise ValueError
+        if len(parts) != 3:
+            raise ValueError
     except:
-        update.message.reply_text("Vui lòng nhập đúng 3 số từ 1 đến 6, cách nhau bằng dấu cách.")
+        update.message.reply_text("Vui lòng nhập đúng 3 số từ 1 đến 6.")
         return
 
     data = sheet.get_all_values()
@@ -103,11 +116,14 @@ def handle_message(update, context):
         last_line = data[-1]
         if len(last_line) >= 3 and all(last_line[i] for i in range(1,4)) and (len(last_line) < 7 or not all(last_line[i] for i in range(4,7))):
             sheet.update(values=[parts], range_name=f"E{last_row}:G{last_row}")
-            try: prediction = list(map(int, last_line[1:4]))
-            except: prediction = None
+            try:
+                prediction = list(map(int, last_line[1:4]))
+            except:
+                prediction = None
 
-    models = train_models(data)
-    new_prediction = majority_vote(models, parts)
+    models = train_model(data)
+    new_prediction = predict_next(models, parts)
+
     sheet.update(values=[new_prediction], range_name=f"B{last_row+1}:D{last_row+1}")
 
     if prediction:
@@ -121,18 +137,17 @@ def handle_message(update, context):
     else:
         update.message.reply_text(f"Dự đoán tiếp theo: {new_prediction}")
 
-# === Chạy bot Telegram ===
+# Khởi động bot
 def main():
     updater = Updater(TELEGRAM_TOKEN, use_context=True, workers=4)
     dp = updater.dispatcher
     dp.add_handler(MessageHandler(Filters.text & ~Filters.command, handle_message))
-    scheduler = BackgroundScheduler()
-    scheduler.start()
+    BackgroundScheduler().start()
     updater.start_polling()
-    print("Bot đang chạy...")
+    print("Bot is running...")
     updater.idle()
 
-# === Bắt đầu ===
+# Chạy
 if __name__ == "__main__":
     keep_alive()
     main()
