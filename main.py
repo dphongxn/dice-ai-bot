@@ -1,46 +1,50 @@
 from flask import Flask
 from threading import Thread
+import logging
+import os
+import json
+import random
+import numpy as np
+import pandas as pd
+import gspread
+from oauth2client.service_account import ServiceAccountCredentials
+from telegram.ext import Updater, MessageHandler, Filters
+from apscheduler.schedulers.background import BackgroundScheduler
 
+from sklearn.ensemble import (
+    GradientBoostingClassifier,
+    RandomForestClassifier,
+    AdaBoostClassifier,
+    ExtraTreesClassifier,
+    BaggingClassifier,
+    VotingClassifier,
+)
+from sklearn.linear_model import LogisticRegression
+
+# === FLASK KEEP-ALIVE ===
 app = Flask(__name__)
-
-@app.route('/')
+@app.route("/")
 def home():
-    return "✅ Bot is alive!"
-
+    return "Bot is alive!"
 def run():
     app.run(host='0.0.0.0', port=8080)
-
 def keep_alive():
     t = Thread(target=run)
     t.start()
 
-# ===================== BOT LOGIC =====================
-
-import logging
-import random
-import numpy as np
-import pandas as pd
-from sklearn.ensemble import RandomForestClassifier, GradientBoostingClassifier, AdaBoostClassifier, ExtraTreesClassifier
-from sklearn.linear_model import LogisticRegression
-from sklearn.svm import SVC
-from sklearn.ensemble import VotingClassifier
-from oauth2client.service_account import ServiceAccountCredentials
-import gspread
-from telegram.ext import Updater, MessageHandler, Filters
-from apscheduler.schedulers.background import BackgroundScheduler
-
-# Telegram token
-TELEGRAM_TOKEN = "8174193582:AAGrcq5TOTlOV9l_JVPlEV_E0o6RuI6nmuE"
-
-# Google Sheet
+# === GOOGLE SHEET SETUP ===
 scope = ["https://spreadsheets.google.com/feeds", "https://www.googleapis.com/auth/drive"]
-creds = ServiceAccountCredentials.from_json_keyfile_name("credentials.json", scope)
+creds_json = os.environ.get("GOOGLE_CREDS")
+creds_dict = json.loads(creds_json)
+creds = ServiceAccountCredentials.from_json_keyfile_dict(creds_dict, scope)
 client = gspread.authorize(creds)
 sheet = client.open("app dự đoán 1mf3").worksheet("App dự đoán beta")
 
-# Logging
-logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
+# === TELEGRAM SETUP ===
+TELEGRAM_TOKEN = "8174193582:AAGrcq5TOTlOV9l_JVPlEV_E0o6RuI6nmuE"
+logging.basicConfig(format='%(asctime)s - %(levelname)s - %(message)s', level=logging.INFO)
 
+# === FUNCTION: Calculate Accuracy ===
 def calculate_accuracy():
     data = sheet.get_all_values()
     total, correct = 0, 0
@@ -55,43 +59,46 @@ def calculate_accuracy():
             continue
     return round(correct / total * 100, 2) if total else 0
 
+# === FUNCTION: Train Ensemble Model ===
 def train_model(data):
     X, y1, y2, y3 = [], [], [], []
-    for i in range(len(data)-1):
+    for i in range(len(data) - 1):
         try:
-            current = list(map(int, data[i][4:7]))
-            nxt = list(map(int, data[i+1][4:7]))
-            X.append(current)
-            y1.append(nxt[0])
-            y2.append(nxt[1])
-            y3.append(nxt[2])
+            row = list(map(int, data[i][4:7]))
+            next_row = list(map(int, data[i + 1][4:7]))
+            X.append(row)
+            y1.append(next_row[0])
+            y2.append(next_row[1])
+            y3.append(next_row[2])
         except:
             continue
-    if not X:
-        return None, None, None
+
+    if not X: return None, None, None
 
     def build_ensemble(y):
         models = [
-            ('lr', LogisticRegression(max_iter=1000)),
-            ('rf', RandomForestClassifier()),
             ('gb', GradientBoostingClassifier()),
+            ('rf', RandomForestClassifier()),
             ('ada', AdaBoostClassifier()),
             ('et', ExtraTreesClassifier()),
-            ('svc', SVC(probability=True))
+            ('bag', BaggingClassifier()),
+            ('lr', LogisticRegression(max_iter=1000))
         ]
-        return VotingClassifier(estimators=models, voting='soft').fit(X, y)
+        ensemble = VotingClassifier(estimators=models, voting='soft')
+        return ensemble.fit(X, y)
 
     return build_ensemble(y1), build_ensemble(y2), build_ensemble(y3)
 
+# === FUNCTION: Predict Next ===
 def predict_next(models, last_result):
-    if not all(models) or not last_result:
-        return random.sample(range(1,7), 3)
+    if not all(models): return random.sample(range(1,7), 3)
     x = np.array(last_result).reshape(1, -1)
     try:
         return [int(m.predict(x)[0]) for m in models]
     except:
         return random.sample(range(1,7), 3)
 
+# === TELEGRAM HANDLER ===
 def handle_message(update, context):
     text = update.message.text.strip()
     try:
@@ -130,6 +137,7 @@ def handle_message(update, context):
     else:
         update.message.reply_text(f"Dự đoán tiếp theo: {new_prediction}")
 
+# === MAIN ===
 def main():
     updater = Updater(TELEGRAM_TOKEN, use_context=True)
     dp = updater.dispatcher
@@ -140,7 +148,7 @@ def main():
     print("Bot đang chạy...")
     updater.idle()
 
-# --- CHẠY ---
+# === RUN ===
 if __name__ == "__main__":
     keep_alive()
     main()
