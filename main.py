@@ -1,124 +1,117 @@
 import os
 import json
 import logging
+from flask import Flask, request
+from telegram import Update, Bot
+from telegram.ext import Dispatcher, CommandHandler, MessageHandler, Filters
+from oauth2client.service_account import ServiceAccountCredentials
+import gspread
 import pandas as pd
 import numpy as np
-import gspread
-import pytz
-from flask import Flask
-from datetime import datetime
-from oauth2client.service_account import ServiceAccountCredentials
-from sklearn.ensemble import RandomForestClassifier, GradientBoostingClassifier, VotingClassifier
 from sklearn.linear_model import LogisticRegression
-from sklearn.neighbors import KNeighborsClassifier
-from sklearn.tree import DecisionTreeClassifier
+from sklearn.ensemble import RandomForestClassifier, GradientBoostingClassifier, VotingClassifier
 from sklearn.svm import SVC
-from sklearn.preprocessing import StandardScaler
-from apscheduler.schedulers.background import BackgroundScheduler
-from telegram import Update
-from telegram.ext import Updater, CommandHandler, CallbackContext
+from sklearn.neighbors import KNeighborsClassifier
+from sklearn.naive_bayes import GaussianNB
 
-# Setup logging
-logging.basicConfig(format='%(asctime)s - %(levelname)s - %(message)s', level=logging.INFO)
+# Logging
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
 
 # Biến môi trường
-TOKEN = os.getenv("TELEGRAM_TOKEN")
-GOOGLE_CREDS = os.getenv("GOOGLE_CREDS")
+TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN")
+WEBHOOK_URL = os.environ.get("WEBHOOK_URL")
+GOOGLE_CREDS = os.environ.get("GOOGLE_CREDS")
 
-# Google Sheets setup
+# Khởi tạo bot
+bot = Bot(token=TELEGRAM_TOKEN)
+
+# Flask App
+app = Flask(__name__)
+
+# Đọc Google credentials
 scope = ["https://spreadsheets.google.com/feeds", "https://www.googleapis.com/auth/drive"]
 creds_dict = json.loads(GOOGLE_CREDS)
 creds = ServiceAccountCredentials.from_json_keyfile_dict(creds_dict, scope)
 client = gspread.authorize(creds)
-sheet = client.open("app dự đoán 1mf3").worksheet("App dự đoán beta")
+sheet = client.open("App dự đoán 1mf3").worksheet("App dự đoán beta")
 
-# Hàm huấn luyện mô hình
-def train_model():
-    data = pd.DataFrame(sheet.get_all_records())
-    if len(data) < 20:
-        return None
+# Hàm lấy dữ liệu huấn luyện
+def get_training_data():
+    data = sheet.get_all_values()
+    df = pd.DataFrame(data[1:], columns=data[0])
+    df = df[['E', 'F', 'G']].dropna()
+    X = df.shift(1).dropna().astype(int)
+    y = df.iloc[1:].astype(int)
+    y = y[['E', 'F', 'G']].apply(lambda row: sorted([int(row['E']), int(row['F']), int(row['G'])]), axis=1)
+    return X.values, y.values
 
-    X = data[['E', 'F', 'G']].values
-    y = data[['B', 'C', 'D']].values
-    y = [sorted(row) for row in y]
-
-    # Mã hóa đầu ra thành chuỗi
-    y = [''.join(map(str, row)) for row in y]
-    
-    scaler = StandardScaler()
-    X_scaled = scaler.fit_transform(X)
+# Hàm huấn luyện và dự đoán
+def predict_dice():
+    X, y = get_training_data()
+    y_flat = [",".join(map(str, row)) for row in y]
 
     models = [
         ('lr', LogisticRegression(max_iter=1000)),
-        ('knn', KNeighborsClassifier()),
-        ('dt', DecisionTreeClassifier()),
-        ('svc', SVC(probability=True)),
         ('rf', RandomForestClassifier()),
-        ('gb', GradientBoostingClassifier())
+        ('svc', SVC(probability=True)),
+        ('knn', KNeighborsClassifier()),
+        ('gb', GradientBoostingClassifier()),
+        ('nb', GaussianNB())
     ]
-    
+
     ensemble = VotingClassifier(estimators=models, voting='soft')
-    ensemble.fit(X_scaled, y)
-    
-    return ensemble, scaler
+    ensemble.fit(X, y_flat)
 
-# Dự đoán
-def predict(model, scaler):
-    data = pd.DataFrame(sheet.get_all_records())
-    if len(data) < 1:
-        return None
+    last_row = X[-1].reshape(1, -1)
+    prediction = ensemble.predict(last_row)[0]
+    return list(map(int, prediction.split(',')))
 
-    last_row = data.iloc[-1][['E', 'F', 'G']].values
-    X = scaler.transform([last_row])
-    prediction = model.predict(X)[0]
-    return list(prediction)
+# Hàm xử lý tin nhắn
+def handle_message(update: Update, context):
+    text = update.message.text.strip()
+    try:
+        if text.lower().startswith("kq"):
+            parts = list(map(int, text.replace("kq", "").strip().split()))
+            if len(parts) != 3: raise ValueError("Sai định dạng. Nhập: kq 1 2 3")
 
-# Cập nhật dự đoán tự động
-def update_prediction():
-    model_data = train_model()
-    if not model_data:
-        logging.warning("Không đủ dữ liệu để huấn luyện.")
-        return
+            last_row = len(sheet.get_all_values())
+            sheet.update(range_name=f"E{last_row}:G{last_row}", values=[parts])
 
-    model, scaler = model_data
-    new_prediction = predict(model, scaler)
-    if not new_prediction:
-        return
+            prediction = predict_dice()
+            sheet.update(range_name=f"B{last_row+1}:D{last_row+1}", values=[prediction])
 
-    data = pd.DataFrame(sheet.get_all_records())
-    last_row = len(data) + 1
-    sheet.update(range_name=f"B{last_row}:D{last_row}", values=[new_prediction])
-    logging.info(f"Cập nhật dự đoán: {new_prediction}")
+            correct = sorted(parts) == sorted(prediction)
+            update.message.reply_text(
+                f"Dự đoán: {prediction} | Kết quả: {parts} => {'ĐÚNG' if correct else 'SAI'}"
+            )
+        else:
+            update.message.reply_text("Gõ 'kq 1 2 3' để ghi kết quả xúc xắc!")
+    except Exception as e:
+        logger.error(str(e))
+        update.message.reply_text("Đã có lỗi xảy ra: " + str(e))
 
-# Telegram command
-def start(update: Update, context: CallbackContext):
-    update.message.reply_text("Bot Ensemble AI dự đoán xúc xắc đã sẵn sàng!")
+# Thiết lập dispatcher
+dispatcher = Dispatcher(bot, None, workers=4, use_context=True)
+dispatcher.add_handler(MessageHandler(Filters.text & ~Filters.command, handle_message))
 
-def status(update: Update, context: CallbackContext):
-    update.message.reply_text("Bot đang chạy ổn định. Bạn có thể nhập kết quả mới trên Google Sheet.")
+# Route cho Telegram Webhook
+@app.route(f"/{TELEGRAM_TOKEN}", methods=["POST"])
+def webhook():
+    update = Update.de_json(request.get_json(force=True), bot)
+    dispatcher.process_update(update)
+    return "OK", 200
 
-# Flask server để giữ bot hoạt động
-app = Flask(__name__)
+# Route kiểm tra server
+@app.route("/", methods=["GET"])
+def index():
+    return "EnsembleAI đang hoạt động!", 200
 
-@app.route('/')
-def home():
-    return "Ensemble AI đang chạy..."
-
-# Hàm chính
-def main():
-    updater = Updater(TOKEN, use_context=True, workers=4)
-    dp = updater.dispatcher
-
-    dp.add_handler(CommandHandler("start", start))
-    dp.add_handler(CommandHandler("status", status))
-
-    # Scheduler
-    scheduler = BackgroundScheduler(timezone=pytz.timezone("Asia/Ho_Chi_Minh"))
-    scheduler.add_job(update_prediction, 'interval', minutes=1)
-    scheduler.start()
-
-    updater.start_polling()
-    app.run(host='0.0.0.0', port=10000)
+# Hàm khởi động webhook
+def set_webhook():
+    webhook_url = f"{WEBHOOK_URL}/{TELEGRAM_TOKEN}"
+    bot.set_webhook(url=webhook_url)
 
 if __name__ == "__main__":
-    main()
+    set_webhook()
+    app.run(host="0.0.0.0", port=10000)
