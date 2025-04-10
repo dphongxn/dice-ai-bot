@@ -1,114 +1,123 @@
 import os
 import json
 import logging
-from flask import Flask
-from threading import Thread
 import numpy as np
 import pandas as pd
+from flask import Flask, request
+from sklearn.linear_model import LogisticRegression
+from sklearn.ensemble import RandomForestClassifier, GradientBoostingClassifier, VotingClassifier
+from sklearn.svm import SVC
+from sklearn.naive_bayes import GaussianNB
+from sklearn.neighbors import KNeighborsClassifier
+from telegram import Update, Bot
+from telegram.ext import Dispatcher, CommandHandler, MessageHandler, Filters
 import gspread
 from oauth2client.service_account import ServiceAccountCredentials
-from sklearn.ensemble import RandomForestClassifier, GradientBoostingClassifier, AdaBoostClassifier, VotingClassifier
-from sklearn.linear_model import LogisticRegression
-from sklearn.svm import SVC
-from sklearn.tree import DecisionTreeClassifier
-from sklearn.preprocessing import LabelEncoder
-from sklearn.model_selection import train_test_split
-from telegram.ext import Updater, CommandHandler, MessageHandler, Filters
+from apscheduler.schedulers.background import BackgroundScheduler
 
-# === Keep alive server ===
+# Logging
+logging.basicConfig(level=logging.INFO)
+
+# ENV
+TOKEN = os.getenv("TELEGRAM_TOKEN")
+SPREADSHEET_NAME = os.getenv("SPREADSHEET_NAME", "App dự đoán 1mf3")
+WORKSHEET_NAME = os.getenv("WORKSHEET_NAME", "App dự đoán beta")
+GOOGLE_CREDS = json.loads(os.getenv("GOOGLE_CREDS"))
+
+# Bot & Flask setup
+bot = Bot(token=TOKEN)
 app = Flask(__name__)
-@app.route('/')
-def index():
-    return 'Bot is running...'
+dispatcher = Dispatcher(bot, None, workers=4)
 
-def run():
-    app.run(host='0.0.0.0', port=10000)
-
-Thread(target=run).start()
-
-# === Google Sheets setup ===
-scope = ['https://spreadsheets.google.com/feeds', 'https://www.googleapis.com/auth/drive']
-google_creds = json.loads(os.getenv('GOOGLE_CREDS'))
-creds = ServiceAccountCredentials.from_json_keyfile_dict(google_creds, scope)
+# Google Sheets setup
+scope = ["https://spreadsheets.google.com/feeds", "https://www.googleapis.com/auth/drive"]
+creds = ServiceAccountCredentials.from_json_keyfile_dict(GOOGLE_CREDS, scope)
 client = gspread.authorize(creds)
-sheet = client.open("App dự đoán 1mf3").worksheet("App dự đoán beta")
+sheet = client.open(SPREADSHEET_NAME).worksheet(WORKSHEET_NAME)
 
-# === Model setup ===
-def get_data():
-    data = pd.DataFrame(sheet.get_all_records())
-    valid_data = data.dropna(subset=["E", "F", "G"])  # Cột kết quả thực tế
-    if len(valid_data) < 5:
-        return None, None
-    X = valid_data[["E", "F", "G"]].values[:-1]
-    y = valid_data[["E", "F", "G"]].apply(lambda row: ''.join(sorted(map(str, row))), axis=1).values[1:]
-    le = LabelEncoder()
-    y_encoded = le.fit_transform(y)
-    return X, y_encoded
+# ML Models
+def train_models():
+    data = sheet.get_all_values()[1:]
+    df = pd.DataFrame(data, columns=["A", "B", "C", "E", "F", "G"])
+    df = df.dropna()
+    X = df[["E", "F", "G"]].astype(int)
+    y = df[["B", "C", "D"]].astype(int)
 
-def train_ensemble(X, y):
     models = [
         ('lr', LogisticRegression(max_iter=1000)),
         ('rf', RandomForestClassifier()),
         ('gb', GradientBoostingClassifier()),
-        ('svc', SVC(probability=True)),
-        ('ada', AdaBoostClassifier()),
-        ('dt', DecisionTreeClassifier())
+        ('svm', SVC(probability=True)),
+        ('nb', GaussianNB()),
+        ('knn', KNeighborsClassifier())
     ]
+
+    classifiers = []
+    for name, model in models:
+        clf = model.fit(X, y)
+        classifiers.append((name, clf))
+
     ensemble = VotingClassifier(estimators=models, voting='soft')
     ensemble.fit(X, y)
+
     return ensemble
 
-def predict_next(model, last_result):
-    result = np.array(last_result).reshape(1, -1)
-    prediction = model.predict(result)[0]
-    return prediction
+model = train_models()
 
-# === Telegram Bot setup ===
-TOKEN = os.getenv('BOT_TOKEN')
-updater = Updater(token=TOKEN, use_context=True, workers=4)
-dispatcher = updater.dispatcher
-
+# Handlers
 def start(update, context):
-    update.message.reply_text("Gửi kết quả xúc xắc theo cú pháp: 2 4 6")
+    update.message.reply_text("Gửi kết quả xúc xắc dạng: 1 2 3")
 
 def handle_message(update, context):
-    text = update.message.text.strip()
-    chat_id = update.effective_chat.id
-
     try:
+        text = update.message.text.strip()
         parts = list(map(int, text.split()))
-        if len(parts) != 3 or any(p < 1 or p > 6 for p in parts):
-            raise ValueError
-    except ValueError:
-        update.message.reply_text("Vui lòng gửi đúng 3 số từ 1 đến 6. Ví dụ: 2 3 6")
-        return
+        if len(parts) != 3 or not all(1 <= p <= 6 for p in parts):
+            update.message.reply_text("Vui lòng gửi đúng định dạng: 1 2 3")
+            return
 
-    # Ghi kết quả vào sheet
-    all_data = sheet.get_all_values()
-    last_row = len(all_data) + 1
-    sheet.update(f"E{last_row}:G{last_row}", [parts])
+        last_row = len(sheet.get_all_values()) + 1
+        sheet.update(range_name=f"E{last_row}:G{last_row}", values=[parts])
 
-    # Lấy dữ liệu và huấn luyện
-    X, y = get_data()
-    if X is None:
-        update.message.reply_text("Chưa đủ dữ liệu để dự đoán. Vui lòng gửi thêm!")
-        return
+        pred = model.predict([parts])[0]
+        pred_list = list(pred)
+        sheet.update(range_name=f"B{last_row}:D{last_row}", values=[pred_list])
 
-    model = train_ensemble(X, y)
+        update.message.reply_text(f"Dự đoán: {pred_list}")
+    except Exception as e:
+        logging.error(f"Lỗi xử lý tin nhắn: {e}")
+        update.message.reply_text("Đã xảy ra lỗi!")
 
-    # Dự đoán tiếp theo
-    last_result = parts
-    pred_label = predict_next(model, last_result)
-    update.message.reply_text(f"Đã ghi nhận kết quả!\nDự đoán tiếp theo: {pred_label}")
+# Scheduler để giữ máy sống
+scheduler = BackgroundScheduler()
+scheduler.start()
 
-def error_handler(update, context):
-    print(f"Lỗi: {context.error}")
-    if update:
-        context.bot.send_message(chat_id=update.effective_chat.id, text="Có lỗi xảy ra. Vui lòng thử lại sau!")
-
+# Register handlers
 dispatcher.add_handler(CommandHandler("start", start))
 dispatcher.add_handler(MessageHandler(Filters.text & ~Filters.command, handle_message))
-dispatcher.add_error_handler(error_handler)
 
-# === Start polling ===
-updater.start_polling()
+# Webhook route
+@app.route(f"/{TOKEN}", methods=["POST"])
+def webhook():
+    update = Update.de_json(request.get_json(force=True), bot)
+    dispatcher.process_update(update)
+    return "ok"
+
+# Home check route
+@app.route("/", methods=["GET"])
+def index():
+    return "Bot is running!"
+
+# Khởi tạo webhook nếu chưa có
+def set_webhook():
+    domain = os.getenv("RENDER_EXTERNAL_URL")
+    if domain:
+        webhook_url = f"{domain}/{TOKEN}"
+        bot.set_webhook(url=webhook_url)
+        logging.info(f"Webhook set to: {webhook_url}")
+    else:
+        logging.warning("RENDER_EXTERNAL_URL not set!")
+
+if __name__ == "__main__":
+    set_webhook()
+    app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 10000)))
