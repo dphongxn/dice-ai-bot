@@ -12,7 +12,8 @@ from sklearn.svm import SVC
 from sklearn.model_selection import train_test_split
 from oauth2client.service_account import ServiceAccountCredentials
 from telegram import Bot, Update
-from telegram.ext import Dispatcher, CommandHandler
+from telegram.ext import MessageHandler, Filters
+dispatcher.add_handler(MessageHandler(Filters.text & ~Filters.command, handle))
 import logging
 from io import StringIO
 
