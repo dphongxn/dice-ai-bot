@@ -34,7 +34,7 @@ scope = ["https://spreadsheets.google.com/feeds", "https://www.googleapis.com/au
 creds_dict = json.loads(GOOGLE_CREDS)
 creds = ServiceAccountCredentials.from_json_keyfile_dict(creds_dict, scope)
 client = gspread.authorize(creds)
-sheet = client.open("App dự đoán 1mf3").worksheet("App dự đoán beta")
+sheet = client.open("app dự đoán 1mf3").worksheet("App dự đoán beta")
 
 # Hàm lấy dữ liệu huấn luyện
 def get_training_data():
