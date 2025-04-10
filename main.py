@@ -1,127 +1,124 @@
 import os
 import json
-import random
 import logging
-import numpy as np
 import pandas as pd
-from flask import Flask, request
-from telegram import Update
-from telegram.ext import Updater, CommandHandler, CallbackContext
-from apscheduler.schedulers.background import BackgroundScheduler
+import numpy as np
+import gspread
+import pytz
+from flask import Flask
+from datetime import datetime
+from oauth2client.service_account import ServiceAccountCredentials
 from sklearn.ensemble import RandomForestClassifier, GradientBoostingClassifier, VotingClassifier
 from sklearn.linear_model import LogisticRegression
+from sklearn.neighbors import KNeighborsClassifier
 from sklearn.tree import DecisionTreeClassifier
-from sklearn.naive_bayes import GaussianNB
 from sklearn.svm import SVC
-from oauth2client.service_account import ServiceAccountCredentials
-import gspread
+from sklearn.preprocessing import StandardScaler
+from apscheduler.schedulers.background import BackgroundScheduler
+from telegram import Update
+from telegram.ext import Updater, CommandHandler, CallbackContext
 
-# Logging
-logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger(__name__)
+# Setup logging
+logging.basicConfig(format='%(asctime)s - %(levelname)s - %(message)s', level=logging.INFO)
 
-# Telegram token từ biến môi trường
-TOKEN = os.environ.get("TELEGRAM_TOKEN")
+# Biến môi trường
+TOKEN = os.getenv("TELEGRAM_TOKEN")
+GOOGLE_CREDS = os.getenv("GOOGLE_CREDS")
 
-# Google credentials từ biến môi trường
-google_creds = os.environ.get("GOOGLE_CREDS")
-creds_dict = json.loads(google_creds)
+# Google Sheets setup
 scope = ["https://spreadsheets.google.com/feeds", "https://www.googleapis.com/auth/drive"]
+creds_dict = json.loads(GOOGLE_CREDS)
 creds = ServiceAccountCredentials.from_json_keyfile_dict(creds_dict, scope)
 client = gspread.authorize(creds)
 sheet = client.open("app dự đoán 1mf3").worksheet("App dự đoán beta")
 
-# Flask App (cho UptimeRobot)
+# Hàm huấn luyện mô hình
+def train_model():
+    data = pd.DataFrame(sheet.get_all_records())
+    if len(data) < 20:
+        return None
+
+    X = data[['E', 'F', 'G']].values
+    y = data[['B', 'C', 'D']].values
+    y = [sorted(row) for row in y]
+
+    # Mã hóa đầu ra thành chuỗi
+    y = [''.join(map(str, row)) for row in y]
+    
+    scaler = StandardScaler()
+    X_scaled = scaler.fit_transform(X)
+
+    models = [
+        ('lr', LogisticRegression(max_iter=1000)),
+        ('knn', KNeighborsClassifier()),
+        ('dt', DecisionTreeClassifier()),
+        ('svc', SVC(probability=True)),
+        ('rf', RandomForestClassifier()),
+        ('gb', GradientBoostingClassifier())
+    ]
+    
+    ensemble = VotingClassifier(estimators=models, voting='soft')
+    ensemble.fit(X_scaled, y)
+    
+    return ensemble, scaler
+
+# Dự đoán
+def predict(model, scaler):
+    data = pd.DataFrame(sheet.get_all_records())
+    if len(data) < 1:
+        return None
+
+    last_row = data.iloc[-1][['E', 'F', 'G']].values
+    X = scaler.transform([last_row])
+    prediction = model.predict(X)[0]
+    return list(prediction)
+
+# Cập nhật dự đoán tự động
+def update_prediction():
+    model_data = train_model()
+    if not model_data:
+        logging.warning("Không đủ dữ liệu để huấn luyện.")
+        return
+
+    model, scaler = model_data
+    new_prediction = predict(model, scaler)
+    if not new_prediction:
+        return
+
+    data = pd.DataFrame(sheet.get_all_records())
+    last_row = len(data) + 1
+    sheet.update(range_name=f"B{last_row}:D{last_row}", values=[new_prediction])
+    logging.info(f"Cập nhật dự đoán: {new_prediction}")
+
+# Telegram command
+def start(update: Update, context: CallbackContext):
+    update.message.reply_text("Bot Ensemble AI dự đoán xúc xắc đã sẵn sàng!")
+
+def status(update: Update, context: CallbackContext):
+    update.message.reply_text("Bot đang chạy ổn định. Bạn có thể nhập kết quả mới trên Google Sheet.")
+
+# Flask server để giữ bot hoạt động
 app = Flask(__name__)
 
 @app.route('/')
 def home():
-    return 'Ensemble AI đang hoạt động.'
+    return "Ensemble AI đang chạy..."
 
-@app.route('/ping', methods=['GET', 'HEAD'])
-def ping():
-    return 'pong', 200
-
-# Lấy dữ liệu train
-def load_data():
-    values = sheet.get_all_values()[1:]  # Bỏ header
-    data = []
-    labels = []
-    for row in values:
-        try:
-            x = list(map(int, row[4:7]))
-            y = 1 if sorted(map(int, row[1:4])) == sorted(x) else 0
-            data.append(x)
-            labels.append(y)
-        except:
-            continue
-    return np.array(data), np.array(labels)
-
-# Tạo mô hình Ensemble AI
-def train_model():
-    X, y = load_data()
-    if len(X) < 10:
-        return None  # Dữ liệu quá ít
-    models = [
-        ('rf', RandomForestClassifier()),
-        ('gb', GradientBoostingClassifier()),
-        ('lr', LogisticRegression()),
-        ('dt', DecisionTreeClassifier()),
-        ('nb', GaussianNB()),
-        ('svc', SVC(probability=True))
-    ]
-    ensemble = VotingClassifier(estimators=models, voting='soft')
-    ensemble.fit(X, y)
-    return ensemble
-
-# Dự đoán
-def predict():
-    model = train_model()
-    if model is None:
-        return random.sample(range(1, 7), 3)
-    best = None
-    best_score = -1
-    for _ in range(100):
-        x = [random.randint(1, 6) for _ in range(3)]
-        score = model.predict_proba([x])[0][1]
-        if score > best_score:
-            best = x
-            best_score = score
-    return best
-
-# Cập nhật kết quả vào Sheet
-def update_sheet():
-    values = sheet.get_all_values()
-    last_row = len(values)
-    row = values[-1]
-    if all(cell.strip() for cell in row[4:7]) and not all(cell.strip() for cell in row[1:4]):
-        new_prediction = predict()
-        sheet.update(range_name=f"B{last_row + 1}:D{last_row + 1}", values=[new_prediction])
-        logger.info(f"Đã cập nhật dự đoán: {new_prediction}")
-
-# Command /start từ người dùng
-def start(update: Update, context: CallbackContext):
-    update.message.reply_text("Xin chào! Đây là Ensemble AI dự đoán xúc xắc. Hãy nhập kết quả 3 viên để nhận dự đoán tiếp theo!")
-
-# Command /predict để test nhanh
-def manual_predict(update: Update, context: CallbackContext):
-    result = predict()
-    update.message.reply_text(f"Dự đoán từ Ensemble AI: {result}")
-
+# Hàm chính
 def main():
-    updater = Updater(token=TOKEN, use_context=True, workers=4)
+    updater = Updater(TOKEN, use_context=True, workers=4)
     dp = updater.dispatcher
-    dp.add_handler(CommandHandler("start", start))
-    dp.add_handler(CommandHandler("predict", manual_predict))
 
-    # Lịch trình cập nhật Google Sheet
-    scheduler = BackgroundScheduler()
-    scheduler.add_job(update_sheet, 'interval', minutes=1)
+    dp.add_handler(CommandHandler("start", start))
+    dp.add_handler(CommandHandler("status", status))
+
+    # Scheduler
+    scheduler = BackgroundScheduler(timezone=pytz.timezone("Asia/Ho_Chi_Minh"))
+    scheduler.add_job(update_prediction, 'interval', minutes=1)
     scheduler.start()
 
-    # Start bot
     updater.start_polling()
     app.run(host='0.0.0.0', port=10000)
 
-if __name__ == '__main__':
+if __name__ == "__main__":
     main()
