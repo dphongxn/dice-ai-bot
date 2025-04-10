@@ -42,7 +42,7 @@ scope = ["https://spreadsheets.google.com/feeds", "https://www.googleapis.com/au
 creds_dict = json.loads(GOOGLE_CREDS)
 credentials = ServiceAccountCredentials.from_json_keyfile_dict(creds_dict, scope)
 client = gspread.authorize(credentials)
-sheet = client.open("App dự đoán 1mf3").worksheet("App dự đoán beta")
+sheet = client.open("app dự đoán 1mf3").worksheet("App dự đoán beta")
 
 # --- ML Models Setup ---
 def load_data():
